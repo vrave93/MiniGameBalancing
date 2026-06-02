@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Html Balancing Mini-Game - Persistent Tilt Offset</title>
+    <style>
+        body {
+            background-color: #111;
+            color: #fff;
+            font-family: 'Malgun Gothic', sans-serif;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+            user-select: none;
+        }
+        #gameCanvas {
+            background-color: #1a1a1a;
+            border: 2px solid #333;
+            border-radius: 20px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.7);
+            cursor: none;
+        }
+        .control-panel {
+            margin-top: 20px;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            font-size: 14px;
+        }
+        .time-display {
+            font-size: 16px;
+            color: #00A2FF;
+            margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="gameCanvas" width="600" height="500"></canvas>
+
+<div class="control-panel">
+    <label for="timeLimitSlider">제한 시간 설정 (Survival_Time): 5초 |--| 60초</label>
+    <input type="range" id="timeLimitSlider" min="5" max="60" value="20" step="1" style="cursor:pointer">
+    <span id="currentTimeLimit">현재 설정값: 20초</span>
+    <span id="suppressionTimerDisplay" class="time-display">제어 억제: 0.0s</span>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const timeLimitSlider = document.getElementById('timeLimitSlider');
+const currentTimeLimit = document.getElementById('currentTimeLimit');
+const suppressionTimerDisplay = document.getElementById('suppressionTimerDisplay');
+
+// --- [기획 사양서 데이터 시트] ---
+const CONFIG = {
+    Time_Limit: parseInt(timeLimitSlider.value), 
+    
+    Balancing_Bar_Width: 360,
+    Balancing_Orb_Radius: 22,
+    Failure_Point_Margin_L: -45,
+    Failure_Point_Margin_R: 45,
+    
+    Gravity_Accel: 0.18,
+    Safe_Zone_Fric_ice: 0.98,
+    Mouse_Sensitivity: 0.08,
+    Mouse_Input_Dampening: 0.8,
+    
+    Debris_Spawn_Interval: 1.2,
+    Debris_Fall_Speed_Min: 200,
+    Debris_Fall_Speed_Max: 350,
+    Debris_Impact_Force: 0.28,
+    Debris_Deletion_Threshold: 500,
+    
+    Debris_Impact_Cooldown: 0.5,
+    Suppressed_Sensitivity_Multiplier: 0.05,
+};
+
+// --- 게임 상태 변수 ---
+let gameState = 'PLAYING';
+let timeLeft = CONFIG.Time_Limit;
+
+// 물리/조작 변수
+let mouseX = canvas.width / 2;
+let targetPivotInput = 0;
+let pivotControlInput = 0;
+let barAngle = 0;
+let orbPosition = 0;
+let orbVelocity = 0;
+
+// [신규 핵심 변수] 파편 타격에 의한 영구적 기울기 오프셋
+let debrisTiltOffset = 0; 
+
+// 잔해 및 타이머
+let debrisList = [];
+let debrisTimer = 0;
+let controlSuppressionTimer = 0;
+
+// --- 이벤트 핸들러 ---
+canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    mouseX = e.clientX - rect.left;
+    
+    const sliderWidth = 360;
+    const sliderLeft = (canvas.width - sliderWidth) / 2;
+    let inputRatio = (mouseX - sliderLeft) / sliderWidth;
+    inputRatio = Math.max(0, Math.min(1, inputRatio));
+    targetPivotInput = (inputRatio - 0.5) * 2; 
+});
+
+timeLimitSlider.addEventListener('input', () => {
+    CONFIG.Time_Limit = parseInt(timeLimitSlider.value);
+    currentTimeLimit.textContent = `현재 설정값: ${CONFIG.Time_Limit}초`;
+    if (gameState === 'SUCCESS' || gameState === 'FAIL') {
+        timeLeft = CONFIG.Time_Limit; 
+    }
+});
+
+function spawnDebris() {
+    const halfBarWidth = CONFIG.Balancing_Bar_Width / 2;
+    const centerX = canvas.width / 2;
+    const minX = centerX - halfBarWidth - 10;
+    const maxX = centerX + halfBarWidth + 10;
+    
+    debrisList.push({
+        x: Math.random() * (maxX - minX) + minX,
+        y: -30,
+        speed: Math.random() * (CONFIG.Debris_Fall_Speed_Max - CONFIG.Debris_Fall_Speed_Min) + CONFIG.Debris_Fall_Speed_Min,
+        radius: Math.random() * 6 + 6,
+        color: Math.random() > 0.5 ? '#ff5533' : '#997766',
+        isActive: true
+    });
+}
+
+// --- 게임 루프 업데이트 ---
+let lastTime = performance.now();
+
+function update(time) {
+    let dt = (time - lastTime) / 1000;
+    if (dt > 0.1) dt = 0.1;
+    lastTime = time;
+
+    if (gameState === 'PLAYING') {
+        // 1. 시간 및 승패 처리
+        timeLeft -= dt;
+        if (timeLeft <= 0) {
+            timeLeft = 0;
+            gameState = 'SUCCESS';
+        }
+
+        // 2. 잔해 스폰
+        debrisTimer += dt;
+        if (debrisTimer >= CONFIG.Debris_Spawn_Interval) {
+            spawnDebris();
+            debrisTimer = 0;
+        }
+
+        // 3. 제어 억제 타이머
+        let currentSensitivity = CONFIG.Mouse_Sensitivity;
+        if (controlSuppressionTimer > 0) {
+            controlSuppressionTimer -= dt;
+            if (controlSuppressionTimer < 0) controlSuppressionTimer = 0;
+            currentSensitivity *= CONFIG.Suppressed_Sensitivity_Multiplier; 
+        }
+
+        // 4. 막대 각도 연산 (마우스 입력 보간)
+        pivotControlInput += (targetPivotInput - pivotControlInput) * CONFIG.Mouse_Input_Dampening; 
+        
+        // [수정된 기울기 로직] 마우스 입력값 + 파편 타격에 의한 누적 오프셋 적용
+        let mouseTargetAngle = pivotControlInput * (CONFIG.Failure_Point_Margin_R * Math.PI / 180);
+        let finalTargetAngle = mouseTargetAngle + debrisTiltOffset; 
+        
+        barAngle += (finalTargetAngle - barAngle) * currentSensitivity; 
+
+        // 5. 충돌 검사
+        const centerX = canvas.width / 2;
+        const centerY = 160;
+        const halfBarWidth = CONFIG.Balancing_Bar_Width / 2;
+
+        for (let i = 0; i < debrisList.length; i++) {
+            let d = debrisList[i];
+            if (!d.isActive) continue;
+
+            let prevY = d.y;
+            d.y += d.speed * dt;
+            let currY = d.y;
+
+            let relativeX = d.x - centerX;
+            if (relativeX >= -halfBarWidth && relativeX <= halfBarWidth) {
+                let barLocalY = centerY + (relativeX * Math.sin(barAngle));
+
+                if (prevY - d.radius <= barLocalY && currY + d.radius >= barLocalY) {
+                    d.isActive = false; 
+                    
+                    let distanceRatio = Math.abs(relativeX) / halfBarWidth; 
+                    let sizeRatio = d.radius / 9; 
+                    let finalImpact = CONFIG.Debris_Impact_Force * distanceRatio * sizeRatio;
+
+                    let impactDirection = (relativeX < 0) ? -finalImpact : finalImpact;
+
+                    // [수정된 타격 로직] 즉각적인 꺾임과 동시에 영구적인 오프셋 누적
+                    barAngle += impactDirection; 
+                    debrisTiltOffset += impactDirection; 
+                    
+                    controlSuppressionTimer = CONFIG.Debris_Impact_Cooldown; 
+                    continue; 
+                }
+            }
+
+            if (d.y - d.radius > CONFIG.Debris_Deletion_Threshold) {
+                d.isActive = false;
+            }
+        }
+        
+        debrisList = debrisList.filter(d => d.isActive);
+
+        // 6. 구슬 물리 연산
+        let gravityEffect = Math.sin(barAngle) * CONFIG.Gravity_Accel;
+        orbVelocity += gravityEffect;
+        orbVelocity *= CONFIG.Safe_Zone_Fric_ice;
+        orbPosition += orbVelocity * dt;
+
+        // 7. 실패 조건 검사
+        if (Math.abs(orbPosition) > 1.3) gameState = 'FAIL';
+    }
+
+    render();
+    requestAnimationFrame(update);
+}
+
+// --- 렌더링 ---
+function render() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const centerX = canvas.width / 2;
+    const centerY = 160;
+
+    ctx.save();
+    let gradient = ctx.createLinearGradient(centerX, centerY, centerX, 260);
+    gradient.addColorStop(0, 'rgba(0, 162, 255, 0.3)');
+    gradient.addColorStop(1, 'rgba(0, 162, 255, 0.0)');
+    ctx.fillStyle = gradient;
+    ctx.beginPath();
+    ctx.moveTo(centerX, centerY);
+    ctx.lineTo(centerX + (pivotControlInput * 60) - 30, 240);
+    ctx.lineTo(centerX + (pivotControlInput * 60) + 30, 240);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    for (let d of debrisList) {
+        if (!d.isActive) continue; 
+        ctx.save();
+        ctx.fillStyle = d.color;
+        ctx.shadowBlur = 8;
+        ctx.shadowColor = d.color;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(centerX, centerY);
+    ctx.rotate(barAngle);
+    
+    ctx.strokeStyle = '#4A6270';
+    ctx.lineWidth = 14;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-CONFIG.Balancing_Bar_Width / 2, 0);
+    ctx.lineTo(CONFIG.Balancing_Bar_Width / 2, 0);
+    ctx.stroke();
+
+    let orbX = orbPosition * (CONFIG.Balancing_Bar_Width / 2 - CONFIG.Balancing_Orb_Radius);
+    let orbY = -CONFIG.Balancing_Orb_Radius - 2;
+
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = '#fff';
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(orbX, orbY, CONFIG.Balancing_Orb_Radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    const gaugeW = 360;
+    const gaugeH = 20;
+    const gaugeX = (canvas.width - gaugeW) / 2;
+    const gaugeY = 320;
+
+    ctx.fillStyle = '#220000';
+    ctx.strokeStyle = '#441111';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(gaugeX, gaugeY, gaugeW, gaugeH, 10);
+    ctx.fill();
+    ctx.stroke();
+
+    let fillW = (timeLeft / CONFIG.Time_Limit) * gaugeW;
+    if (fillW > 0) {
+        ctx.fillStyle = '#32CD32';
+        ctx.shadowBlur = 8;
+        ctx.shadowColor = '#32CD32';
+        ctx.beginPath();
+        ctx.roundRect(gaugeX, gaugeY, fillW, gaugeH, 10);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${timeLeft.toFixed(1)}s`, centerX, 385);
+
+    const sliderW = 360;
+    const sliderX = (canvas.width - sliderW) / 2;
+    const sliderY = 430;
+
+    ctx.strokeStyle = '#444';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sliderX, sliderY);
+    ctx.lineTo(sliderX + sliderW, sliderY);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(centerX, sliderY - 5);
+    ctx.lineTo(centerX, sliderY + 5);
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = '#fff';
+    ctx.beginPath();
+    let cursorX = Math.max(sliderX, Math.min(sliderX + sliderW, mouseX));
+    ctx.roundRect(cursorX - 8, sliderY - 12, 16, 24, 4);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    ctx.strokeStyle = '#111';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cursorX, sliderY - 12);
+    ctx.lineTo(cursorX, sliderY - 4);
+    ctx.stroke();
+
+    suppressionTimerDisplay.textContent = `제어 억제: ${controlSuppressionTimer.toFixed(1)}s`;
+
+    if (gameState === 'SUCCESS' || gameState === 'FAIL') {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.font = 'bold 36px sans-serif';
+        ctx.textAlign = 'center';
+        if (gameState === 'SUCCESS') {
+            ctx.fillStyle = '#32CD32';
+            ctx.fillText(`${CONFIG.Time_Limit}초 생존 성공!`, centerX, canvas.height / 2);
+        } else {
+            ctx.fillStyle = '#FF3333';
+            ctx.fillText('구슬이 추락했습니다!', centerX, canvas.height / 2);
+        }
+        ctx.font = '16px sans-serif';
+        ctx.fillStyle = '#aaa';
+        ctx.fillText('새로고침(F5)을 누르면 다시 시작합니다.', centerX, canvas.height / 2 + 50);
+    }
+}
+
+requestAnimationFrame(update);
+</script>
+
+</body>
+</html>
