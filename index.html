@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>Html Balancing Mini-Game - Persistent Tilt Offset</title>
+    <title>Html Balancing Mini-Game - Fixed Fulcrum & Fall Animation</title>
     <style>
         body {
             background-color: #111;
@@ -62,8 +62,6 @@ const CONFIG = {
     
     Balancing_Bar_Width: 360,
     Balancing_Orb_Radius: 22,
-    Failure_Point_Margin_L: -45,
-    Failure_Point_Margin_R: 45,
     
     Gravity_Accel: 0.18,
     Safe_Zone_Fric_ice: 0.98,
@@ -71,6 +69,8 @@ const CONFIG = {
     Mouse_Input_Dampening: 0.8,
     
     Debris_Spawn_Interval: 1.2,
+    Debris_Radius_Min: 6.0,
+    Debris_Radius_Max: 12.0,
     Debris_Fall_Speed_Min: 200,
     Debris_Fall_Speed_Max: 350,
     Debris_Impact_Force: 0.28,
@@ -81,7 +81,7 @@ const CONFIG = {
 };
 
 // --- 게임 상태 변수 ---
-let gameState = 'PLAYING';
+let gameState = 'PLAYING'; // PLAYING, FALLING, SUCCESS, FAIL
 let timeLeft = CONFIG.Time_Limit;
 
 // 물리/조작 변수
@@ -91,9 +91,13 @@ let pivotControlInput = 0;
 let barAngle = 0;
 let orbPosition = 0;
 let orbVelocity = 0;
-
-// [신규 핵심 변수] 파편 타격에 의한 영구적 기울기 오프셋
 let debrisTiltOffset = 0; 
+
+// [신규] 추락 연출용 월드 좌표 변수
+let orbWorldX = 0;
+let orbWorldY = 0;
+let orbFallVelocityX = 0;
+let orbFallVelocityY = 0;
 
 // 잔해 및 타이머
 let debrisList = [];
@@ -117,6 +121,12 @@ timeLimitSlider.addEventListener('input', () => {
     currentTimeLimit.textContent = `현재 설정값: ${CONFIG.Time_Limit}초`;
     if (gameState === 'SUCCESS' || gameState === 'FAIL') {
         timeLeft = CONFIG.Time_Limit; 
+        gameState = 'PLAYING';
+        orbPosition = 0;
+        orbVelocity = 0;
+        barAngle = 0;
+        debrisTiltOffset = 0;
+        debrisList = [];
     }
 });
 
@@ -130,7 +140,7 @@ function spawnDebris() {
         x: Math.random() * (maxX - minX) + minX,
         y: -30,
         speed: Math.random() * (CONFIG.Debris_Fall_Speed_Max - CONFIG.Debris_Fall_Speed_Min) + CONFIG.Debris_Fall_Speed_Min,
-        radius: Math.random() * 6 + 6,
+        radius: Math.random() * (CONFIG.Debris_Radius_Max - CONFIG.Debris_Radius_Min) + CONFIG.Debris_Radius_Min,
         color: Math.random() > 0.5 ? '#ff5533' : '#997766',
         isActive: true
     });
@@ -144,12 +154,16 @@ function update(time) {
     if (dt > 0.1) dt = 0.1;
     lastTime = time;
 
-    if (gameState === 'PLAYING') {
-        // 1. 시간 및 승패 처리
-        timeLeft -= dt;
-        if (timeLeft <= 0) {
-            timeLeft = 0;
-            gameState = 'SUCCESS';
+    // PLAYING 또는 FALLING 상태일 때 막대와 파편 물리 연산은 계속 진행
+    if (gameState === 'PLAYING' || gameState === 'FALLING') {
+        
+        // 1. 시간 및 승패 처리 (PLAYING일 때만)
+        if (gameState === 'PLAYING') {
+            timeLeft -= dt;
+            if (timeLeft <= 0) {
+                timeLeft = 0;
+                gameState = 'SUCCESS';
+            }
         }
 
         // 2. 잔해 스폰
@@ -167,13 +181,10 @@ function update(time) {
             currentSensitivity *= CONFIG.Suppressed_Sensitivity_Multiplier; 
         }
 
-        // 4. 막대 각도 연산 (마우스 입력 보간)
+        // 4. 막대 각도 연산
         pivotControlInput += (targetPivotInput - pivotControlInput) * CONFIG.Mouse_Input_Dampening; 
-        
-        // [수정된 기울기 로직] 마우스 입력값 + 파편 타격에 의한 누적 오프셋 적용
-        let mouseTargetAngle = pivotControlInput * (CONFIG.Failure_Point_Margin_R * Math.PI / 180);
+        let mouseTargetAngle = pivotControlInput * (45 * Math.PI / 180);
         let finalTargetAngle = mouseTargetAngle + debrisTiltOffset; 
-        
         barAngle += (finalTargetAngle - barAngle) * currentSensitivity; 
 
         // 5. 충돌 검사
@@ -201,11 +212,8 @@ function update(time) {
                     let finalImpact = CONFIG.Debris_Impact_Force * distanceRatio * sizeRatio;
 
                     let impactDirection = (relativeX < 0) ? -finalImpact : finalImpact;
-
-                    // [수정된 타격 로직] 즉각적인 꺾임과 동시에 영구적인 오프셋 누적
                     barAngle += impactDirection; 
                     debrisTiltOffset += impactDirection; 
-                    
                     controlSuppressionTimer = CONFIG.Debris_Impact_Cooldown; 
                     continue; 
                 }
@@ -218,14 +226,39 @@ function update(time) {
         
         debrisList = debrisList.filter(d => d.isActive);
 
-        // 6. 구슬 물리 연산
-        let gravityEffect = Math.sin(barAngle) * CONFIG.Gravity_Accel;
-        orbVelocity += gravityEffect;
-        orbVelocity *= CONFIG.Safe_Zone_Fric_ice;
-        orbPosition += orbVelocity * dt;
+        // 6. 구슬 상태별 물리 연산
+        if (gameState === 'PLAYING') {
+            let gravityEffect = Math.sin(barAngle) * CONFIG.Gravity_Accel;
+            orbVelocity += gravityEffect;
+            orbVelocity *= CONFIG.Safe_Zone_Fric_ice;
+            orbPosition += orbVelocity * dt;
 
-        // 7. 실패 조건 검사
-        if (Math.abs(orbPosition) > 1.3) gameState = 'FAIL';
+            // [신규] 막대 끝을 벗어나면 FALLING 상태로 전환 및 초기 월드 좌표 설정
+            if (Math.abs(orbPosition) >= 1.0) {
+                const orbLocalX = Math.sign(orbPosition) * (CONFIG.Balancing_Bar_Width / 2);
+                const orbLocalY = -CONFIG.Balancing_Orb_Radius - 2;
+                
+                // 회전 행렬을 적용하여 막대 로컬 좌표를 화면 월드 좌표로 변환
+                orbWorldX = centerX + Math.cos(barAngle) * orbLocalX - Math.sin(barAngle) * orbLocalY;
+                orbWorldY = centerY + Math.sin(barAngle) * orbLocalX + Math.cos(barAngle) * orbLocalY;
+                
+                // 막대에서 미끄러지던 관성을 부여
+                orbFallVelocityX = (orbVelocity * 400) * Math.cos(barAngle);
+                orbFallVelocityY = (orbVelocity * 400) * Math.sin(barAngle);
+                
+                gameState = 'FALLING';
+            }
+        } else if (gameState === 'FALLING') {
+            // [신규] 추락 중인 구슬의 자유 낙하 물리 연산
+            orbFallVelocityY += 1200 * dt; // 중력 가속도
+            orbWorldX += orbFallVelocityX * dt;
+            orbWorldY += orbFallVelocityY * dt;
+
+            // 화면을 완전히 벗어나면 게임 오버 처리
+            if (orbWorldY > canvas.height + 50) {
+                gameState = 'FAIL';
+            }
+        }
     }
 
     render();
@@ -238,19 +271,21 @@ function render() {
     const centerX = canvas.width / 2;
     const centerY = 160;
 
+    // 1. 피봇 지지대 (가운데 굳건하게 고정된 형태로 수정)
     ctx.save();
     let gradient = ctx.createLinearGradient(centerX, centerY, centerX, 260);
-    gradient.addColorStop(0, 'rgba(0, 162, 255, 0.3)');
+    gradient.addColorStop(0, 'rgba(0, 162, 255, 0.4)');
     gradient.addColorStop(1, 'rgba(0, 162, 255, 0.0)');
     ctx.fillStyle = gradient;
     ctx.beginPath();
     ctx.moveTo(centerX, centerY);
-    ctx.lineTo(centerX + (pivotControlInput * 60) - 30, 240);
-    ctx.lineTo(centerX + (pivotControlInput * 60) + 30, 240);
+    ctx.lineTo(centerX - 40, 240); // ◀ 고정
+    ctx.lineTo(centerX + 40, 240); // ◀ 고정
     ctx.closePath();
     ctx.fill();
     ctx.restore();
 
+    // 2. 파편 렌더링
     for (let d of debrisList) {
         if (!d.isActive) continue; 
         ctx.save();
@@ -263,6 +298,7 @@ function render() {
         ctx.restore();
     }
 
+    // 3. 막대 렌더링
     ctx.save();
     ctx.translate(centerX, centerY);
     ctx.rotate(barAngle);
@@ -275,17 +311,33 @@ function render() {
     ctx.lineTo(CONFIG.Balancing_Bar_Width / 2, 0);
     ctx.stroke();
 
-    let orbX = orbPosition * (CONFIG.Balancing_Bar_Width / 2 - CONFIG.Balancing_Orb_Radius);
-    let orbY = -CONFIG.Balancing_Orb_Radius - 2;
+    // 4. 구슬 렌더링 (상태에 따라 로컬/월드 분리)
+    if (gameState === 'PLAYING') {
+        let orbX = orbPosition * (CONFIG.Balancing_Bar_Width / 2 - CONFIG.Balancing_Orb_Radius);
+        let orbY = -CONFIG.Balancing_Orb_Radius - 2;
 
-    ctx.shadowBlur = 15;
-    ctx.shadowColor = '#fff';
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(orbX, orbY, CONFIG.Balancing_Orb_Radius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = '#fff';
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(orbX, orbY, CONFIG.Balancing_Orb_Radius, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.restore(); // 막대의 회전 컨텍스트 종료
 
+    if (gameState === 'FALLING' || gameState === 'FAIL') {
+        // [신규] 추락할 때는 화면 절대 좌표(World) 기준으로 그려짐
+        ctx.save();
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = '#fff';
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(orbWorldX, orbWorldY, CONFIG.Balancing_Orb_Radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+
+    // 5. UI 게이지
     const gaugeW = 360;
     const gaugeH = 20;
     const gaugeX = (canvas.width - gaugeW) / 2;
@@ -315,6 +367,7 @@ function render() {
     ctx.textAlign = 'center';
     ctx.fillText(`${timeLeft.toFixed(1)}s`, centerX, 385);
 
+    // 6. 하단 마우스 트랙킹 슬라이더 가이드
     const sliderW = 360;
     const sliderX = (canvas.width - sliderW) / 2;
     const sliderY = 430;
@@ -349,6 +402,7 @@ function render() {
 
     suppressionTimerDisplay.textContent = `제어 억제: ${controlSuppressionTimer.toFixed(1)}s`;
 
+    // 7. 결과 화면
     if (gameState === 'SUCCESS' || gameState === 'FAIL') {
         ctx.fillStyle = 'rgba(0, 0, 0, 0.75)';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
